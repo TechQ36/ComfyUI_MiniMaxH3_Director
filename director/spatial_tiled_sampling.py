@@ -280,6 +280,24 @@ def _install_tile_payloads(cfg_guider, *, axis: str, start: int, end: int, tile_
             restorations.append((shape_cond, "cond", shape_cond.cond))
             shape_cond.cond = tile_shapes
 
+        # The denoise mask cond is built once per sampling run from the FULL
+        # canvas (model_base._denoise_mask_values -> [1,1,T,H,W]). It reaches
+        # the model through kwargs, so our per-tile positional mask never wins:
+        # the forward then multiplies a tile-sized output by a full-width mask
+        # ("size of tensor a (60) must match tensor b (86)"). Crop it per tile.
+        mask_cond = model_conds.get("denoise_mask")
+        if mask_cond is not None and hasattr(mask_cond, "cond"):
+            full_mask = mask_cond.cond
+            if (
+                isinstance(full_mask, torch.Tensor)
+                and full_mask.ndim == 5
+                and int(full_mask.shape[-2]) == int(full_h)
+                and int(full_mask.shape[-1]) == int(full_w)
+            ):
+                restorations.append((mask_cond, "cond", full_mask))
+                cropped = _crop_spatial_5d(full_mask, axis, start, end)
+                mask_cond.cond, _, _ = _pad_even_hw(cropped)
+
         payload_cond = model_conds.get("minimax_payload")
         payload = getattr(payload_cond, "cond", None) if payload_cond is not None else None
         if not isinstance(payload, dict):
@@ -444,6 +462,24 @@ def _tiled_model_call(
             tile_mask = None
             if denoise_mask is not None:
                 tile_mask, _, _ = _crop_packed(denoise_mask, full_shapes, axis, ax_start, ax_end)
+            if not getattr(model_k, "_director_tile_probe", False):
+                model_k._director_tile_probe = True
+                cond_masks = []
+                for model_conds in _iter_payloads(cfg):
+                    mc = model_conds.get("denoise_mask")
+                    if mc is not None and hasattr(mc, "cond") and torch.is_tensor(mc.cond):
+                        cond_masks.append(tuple(mc.cond.shape))
+                log.info(
+                    "spatial tiles geometry: canvas=%dx%d region=%d:%d tile=%s arg_mask=%s cond_mask=%s",
+                    full_h,
+                    full_w,
+                    ax_start,
+                    ax_end,
+                    tile_shapes,
+                    tuple(denoise_mask.shape) if torch.is_tensor(denoise_mask) else type(denoise_mask).__name__,
+                    cond_masks,
+                )
+
             if saved_latent_image is not None:
                 model_k.latent_image, _, _ = _crop_packed(
                     saved_latent_image, full_shapes, axis, ax_start, ax_end
